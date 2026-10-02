@@ -17,5 +17,15 @@ public enum RejectReason {
     /** 值的类型与 schema 声明的类型不兼容。 */
     TYPE_MISMATCH,
     /** updateId 与之前一次更新相同，但请求体不一致，疑似错误重放。 */
-    UPDATE_ID_CONFLICT
+    UPDATE_ID_CONFLICT,
+    /** 批量/单台下发的目标设备未注册。 */
+    DEVICE_NOT_REGISTERED,
+    /** 批量下发的设备数超过单批容量上限，整批拒绝、不处理任何一台。 */
+    BATCH_TOO_LARGE,
+    /** 同一 batchId 被用于不同的请求内容（设备清单或期望配置不一致），拒绝覆盖。 */
+    BATCH_ID_CONFLICT,
+    /** 批量请求自身非法（缺少 batchId、设备清单为空或含重复项等），整批拒绝。 */
+    BATCH_INVALID,
+    /** 单台设备在执行下发时抛出异常：隔离为该台失败，不影响其他设备。 */
+    DEVICE_DISPATCH_FAILED
 }
