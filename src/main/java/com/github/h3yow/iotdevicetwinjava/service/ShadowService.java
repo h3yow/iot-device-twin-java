@@ -29,6 +29,10 @@ import java.util.logging.Logger;
  * 3. 幂等重放：同一 updateId + 同一请求体重放，返回首次的完整结论
  *    （idempotentReplay=true），不重复写入、不重复触发；同 updateId 但请求体不同
  *    以 UPDATE_ID_CONFLICT 拒绝。
+ * 3b. 内容级重放：updateId 不同、但请求体签名（baseVersion+timestamp+desired）与
+ *    本设备已处理的某次更新完全一致时，同样回放那次结论并记住新 updateId 的映射。
+ *    由此单台接口与批量接口（批量以 batchId 作为各设备的 updateId）对同一台设备
+ *    重放同一份内容时，结论一致且不重复写状态、不重复下发命令。
  * 4. 成功提交后 version +1，随后驱动一次规则评估（desired 也参与 merged 视图）。
  */
 public class ShadowService {
@@ -38,7 +42,7 @@ public class ShadowService {
     private final DeviceShadowStore store;
     private final RuleEngine ruleEngine;
 
-    /** updateId -> 首次请求体签名。设备锁保证同设备串行，索引只需可见性安全。 */
+    /** (deviceId, updateId) -> 首次请求体签名。按设备隔离，批量复用同一 batchId 不会串台。 */
     private final Map<String, String> updatePayloadSignatures = new ConcurrentHashMap<>();
 
     public ShadowService(DeviceShadowStore store, RuleEngine ruleEngine) {
@@ -58,7 +62,7 @@ public class ShadowService {
 
             // ---- 幂等键相关判定 ----
             if (first != null) {
-                String firstSignature = updatePayloadSignatures.get(update.updateId());
+                String firstSignature = updatePayloadSignatures.get(sigKey(update.deviceId(), update.updateId()));
                 if (!signature.equals(firstSignature)) {
                     LOG.info("[影子更新结论] 判定依据=UPDATE_ID_CONFLICT(updateId 已用于其他请求体)"
                             + " 触发结果=拒绝，无副作用");
@@ -72,6 +76,25 @@ public class ShadowService {
                         + ") 触发结果=回放首次结论，无副作用");
                 return new ShadowUpdateResult(first.deviceId(), first.committed(),
                         shadow.version(), first.newVersion(), true, first.fields());
+            }
+
+            // ---- 内容级重放：不同 updateId 但请求体签名与本设备历史更新一致 ----
+            // （典型场景：单台接口与批量接口互放同一份内容；批量重试换了批次标识）
+            for (Map.Entry<String, ShadowUpdateResult> processed : shadow.processedUpdates().entrySet()) {
+                String processedSignature =
+                        updatePayloadSignatures.get(sigKey(update.deviceId(), processed.getKey()));
+                if (signature.equals(processedSignature)) {
+                    ShadowUpdateResult matched = processed.getValue();
+                    ShadowUpdateResult replay = new ShadowUpdateResult(matched.deviceId(),
+                            matched.committed(), shadow.version(), matched.newVersion(),
+                            true, matched.fields());
+                    remember(sink, shadow, update, replay, signature);
+                    LOG.info("[影子更新结论] 判定依据=内容签名与 updateId=" + processed.getKey()
+                            + " 完全一致(committed=" + matched.committed() + " newVersion="
+                            + matched.newVersion() + ") 触发结果=回放该次结论并记住 updateId="
+                            + update.updateId() + " 的映射，不重复写状态");
+                    return replay;
+                }
             }
 
             // ---- 版本乐观锁检查（整批） ----
@@ -169,8 +192,12 @@ public class ShadowService {
                 shadow.lastSeenTs(), shadow.pendingCommands(), shadow.deliveredCommands(),
                 shadow.deliveredDedupKeys(), shadow.processedReportIds(),
                 shadow.processedReportFingerprints(), Map.copyOf(remembered), shadow.ruleStates());
-        updatePayloadSignatures.put(update.updateId(), signature);
+        updatePayloadSignatures.put(sigKey(shadow.deviceId(), update.updateId()), signature);
         sink.save(withMemory);
+    }
+
+    private static String sigKey(String deviceId, String updateId) {
+        return deviceId + "|" + updateId;
     }
 
     private static String payloadSignature(ShadowUpdate update) {

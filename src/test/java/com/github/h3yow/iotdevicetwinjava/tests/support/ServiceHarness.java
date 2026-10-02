@@ -3,6 +3,7 @@ package com.github.h3yow.iotdevicetwinjava.tests.support;
 import com.github.h3yow.iotdevicetwinjava.model.FieldType;
 import com.github.h3yow.iotdevicetwinjava.model.DeviceSchema;
 import com.github.h3yow.iotdevicetwinjava.model.ThresholdRule;
+import com.github.h3yow.iotdevicetwinjava.service.BatchShadowService;
 import com.github.h3yow.iotdevicetwinjava.service.DeviceLifecycleService;
 import com.github.h3yow.iotdevicetwinjava.service.RuleEngine;
 import com.github.h3yow.iotdevicetwinjava.service.ShadowService;
@@ -23,6 +24,8 @@ public final class ServiceHarness {
     public final RuleEngine ruleEngine = new RuleEngine();
     public final TelemetryService telemetry = new TelemetryService(store, ruleEngine);
     public final ShadowService shadows = new ShadowService(store, ruleEngine);
+    public final BatchShadowService batchShadows =
+            new BatchShadowService(store, shadows, BatchShadowService.defaultDeviceExecutor());
     public final DeviceLifecycleService lifecycle = new DeviceLifecycleService(store);
 
     public static final DeviceSchema DEFAULT_SCHEMA = new DeviceSchema("default-thermostat", 1,

@@ -32,10 +32,11 @@ class HttpEndToEndTest {
         var ruleEngine = config.ruleEngine();
         var telemetry = config.telemetryService(store, ruleEngine);
         var shadow = config.shadowService(store, ruleEngine);
+        var batchShadow = config.batchShadowService(store, shadow);
         var lifecycle = config.deviceLifecycleService(store);
         return standaloneSetup(
                 new DeviceController(lifecycle, telemetry, store),
-                new ShadowController(shadow),
+                new ShadowController(shadow, batchShadow),
                 new RuleAdminController(store)).build();
     }
 
@@ -114,5 +115,52 @@ class HttpEndToEndTest {
         JsonNode bad = json.readTree(badUpdate.getResponse().getContentAsString());
         assertFalse(bad.path("committed").asBoolean());
         assertEquals("UNKNOWN_FIELD", bad.path("fields").get(0).path("reason").asText());
+    }
+
+    @Test
+    void batchUpdateOverHttp() throws Exception {
+        MockMvc mvc = newClient();
+        for (String d : new String[]{"dev-b1", "dev-b2"}) {
+            mvc.perform(post("/api/devices/" + d + "/register")
+                    .contentType(MediaType.APPLICATION_JSON).content("{}")).andReturn();
+        }
+
+        // 批量下发：一台未注册，逐台结论可区分
+        MvcResult first = mvc.perform(post("/api/shadows/batch-update")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("""
+                        {"batchId":"b-http","baseVersion":0,"timestamp":100,
+                         "desired":{"mode":"cool"},
+                         "deviceIds":["dev-b1","dev-b2","dev-ghost"]}
+                        """)).andReturn();
+        JsonNode firstNode = json.readTree(first.getResponse().getContentAsString());
+        assertFalse(firstNode.path("batchRejected").asBoolean());
+        assertEquals(3, firstNode.path("deviceResults").size());
+        assertEquals("DEVICE_NOT_FOUND", firstNode.path("deviceResults").get(2)
+                .path("fields").get(0).path("reason").asText());
+
+        // 同 batchId 同内容重发：幂等重放，逐台结论一致
+        MvcResult replay = mvc.perform(post("/api/shadows/batch-update")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("""
+                        {"batchId":"b-http","baseVersion":0,"timestamp":100,
+                         "desired":{"mode":"cool"},
+                         "deviceIds":["dev-b1","dev-b2","dev-ghost"]}
+                        """)).andReturn();
+        JsonNode replayNode = json.readTree(replay.getResponse().getContentAsString());
+        assertTrue(replayNode.path("idempotentReplay").asBoolean());
+        assertEquals(firstNode.path("deviceResults"), replayNode.path("deviceResults"));
+
+        // 同 batchId 换内容：BATCH_ID_CONFLICT
+        MvcResult conflict = mvc.perform(post("/api/shadows/batch-update")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("""
+                        {"batchId":"b-http","baseVersion":0,"timestamp":101,
+                         "desired":{"mode":"heat"},
+                         "deviceIds":["dev-b1","dev-b2","dev-ghost"]}
+                        """)).andReturn();
+        JsonNode conflictNode = json.readTree(conflict.getResponse().getContentAsString());
+        assertTrue(conflictNode.path("batchRejected").asBoolean());
+        assertEquals("BATCH_ID_CONFLICT", conflictNode.path("rejectReason").asText());
     }
 }

@@ -42,6 +42,11 @@ curl -X POST localhost:8080/api/devices/dev1/reconnect -H 'Content-Type: applica
 # 5) 期望区版本化合并（baseVersion 为读到的当前版本）
 curl -X POST localhost:8080/api/shadows/update -H 'Content-Type: application/json' -d '{
   "deviceId":"dev1","baseVersion":1,"updateId":"u1","timestamp":150,"desired":{"mode":"cool"}}'
+
+# 6) 批量期望配置下发：同一份 desired 一次发给一批设备，逐台返回结论
+curl -X POST localhost:8080/api/shadows/batch-update -H 'Content-Type: application/json' -d '{
+  "batchId":"batch-001","baseVersion":1,"timestamp":160,
+  "desired":{"mode":"cool"},"deviceIds":["dev1","dev2","dev3"]}'
 ```
 
 接口一览：
@@ -52,7 +57,8 @@ curl -X POST localhost:8080/api/shadows/update -H 'Content-Type: application/jso
 | GET  | `/api/devices/{id}/shadow` | 查询设备影子不可变快照 |
 | POST | `/api/devices/{id}/telemetry` | 遥测上报（LWW 收敛 + 幂等 + 规则评估） |
 | POST | `/api/devices/{id}/online` `/offline` `/reconnect` | 生命周期与补发 |
-| POST | `/api/shadows/update` | desired 区版本化合并 |
+| POST | `/api/shadows/update` | desired 区版本化合并（单台） |
+| POST | `/api/shadows/batch-update` | desired 区批量下发（同一份配置发一批设备，逐台结论） |
 | POST/GET | `/api/rules` | 阈值规则管理/查询 |
 
 ---
@@ -120,6 +126,58 @@ curl -X POST localhost:8080/api/shadows/update -H 'Content-Type: application/jso
 | `STALE_VERSION` | 影子更新 baseVersion 落后/偏离当前版本 |
 | `TYPE_MISMATCH` | 值类型与 schema 声明不兼容 |
 | `UPDATE_ID_CONFLICT` | 幂等键 updateId 被不同请求体复用 |
+| `DEVICE_NOT_FOUND` | 批量下发清单中的设备未注册（逐台拒绝，不影响其他设备） |
+| `BATCH_TOO_LARGE` | 批量设备数超过单批上限（500），整批拒绝，不处理任何子集 |
+| `EMPTY_BATCH` | 批量设备清单为空，整批拒绝 |
+| `BATCH_ID_CONFLICT` | 批次标识 batchId 已被另一份内容的批量请求占用 |
+
+---
+
+### 3.4 批量期望配置下发（`BatchShadowService`）
+
+`POST /api/shadows/batch-update` 把**同一份 desired** 一次发给一批设备，
+请求体：`batchId`（批次标识/幂等键）、`baseVersion`（对清单中每台设备统一使用的期望基准版本）、
+`timestamp`、`desired`、`deviceIds`（设备清单）。
+
+**逐台隔离**：每台设备独立走与单台接口完全相同的判定链路（`ShadowService`，设备锁内串行），
+返回的 `deviceResults` 按 deviceId 排序，逐台给出 `committed` / 拒绝原因
+（`UNKNOWN_FIELD`、`TYPE_MISMATCH`、`STALE_VERSION`、`DEVICE_NOT_FOUND` 互相可区分）。
+某台失败不影响其他台已成功的结果；每台结论里的版本号都是该台自己的版本，不会串台。
+批次内重复出现的设备会被去重，只判定一次。
+
+**与单台下发的关系**：批量对每台设备以 `batchId` 作为该设备的 `updateId` 走同一条
+`ShadowService` 判定与幂等记忆链路。此外 `ShadowService` 还有**内容级重放**判定：
+`updateId` 不同、但请求体签名（baseVersion+timestamp+desired）与本设备已处理的某次更新
+完全一致时，回放那次结论（`idempotentReplay=true`）。因此单台接口与批量接口对同一台设备
+重放同一份内容，结论一致，不重复写状态、不重复下发命令。
+
+**幂等重放与标识冲突**：
+- 同 `batchId` + 同内容重发（含网关超时后的并发重试）：整批只执行一次，
+  所有调用方拿到与首次**一模一样**的逐台结论（重放时 `idempotentReplay=true`，
+  包括首次就被拒的那些台的拒绝结论），不重复写状态、不重复下发命令。
+- 同 `batchId` 换了内容（desired、baseVersion、timestamp 或设备清单任一不同）：
+  整批以 `BATCH_ID_CONFLICT` 拒绝，不覆盖已存结论、不写任何设备；已存结论之后仍可正常重放。
+- 批次级校验失败（超限/空清单）的请求**不占用** batchId，修正规模后可用同一标识重发。
+
+**容量上限与并发**：单批设备数上限 **500**（`BatchShadowService.MAX_BATCH_SIZE`），
+超过或为空时整批拒绝（`BATCH_TOO_LARGE` / `EMPTY_BATCH`），不处理任何子集。
+批内不同设备由线程池并行处理，单台处理慢不会卡住整批；同一台设备上的多个批次
+靠设备锁串行，不会出现两个批次互相踩踏——不同内容的批次竞争同一台设备时，
+先到者生效、后到者按 `STALE_VERSION` 拒绝，版本单调推进、结论确定。
+
+**本地复现验证**：
+
+```bash
+mvn test -Dtest=BatchShadowUpdateTest   # 批量语义单测（逐台隔离/重放/冲突/并发/大批量/跨路径）
+mvn test                                # 全部单测（含既有用例，不应回归）
+# 日志中可看到批次标识、每台设备的判定依据与最终结果，例如：
+# [批量逐台] batchId=b-iso device=dev-stale 判定依据=[*:STALE_VERSION] 触发结果=拒绝(currentVersion=1)
+# [批量结论] batchId=b-iso ... 触发结果=生效 2 台，拒绝 3 台，明细=[dev-ok1=生效@v1, ...]
+```
+
+手工验证：按第 1 节启动服务后，用上面第 6 条 curl 下发一批；原样重发得到
+`idempotentReplay=true` 且逐台结论不变；改 `desired` 重发得到 `BATCH_ID_CONFLICT`；
+`deviceIds` 超过 500 台得到 `BATCH_TOO_LARGE`。
 
 ---
 
@@ -157,9 +215,10 @@ mvn test
 |---|---|
 | `TelemetryConvergenceTest` | 乱序收敛、过期拒绝、整批幂等（reportId/内容指纹）、同时间戳冲突、未知字段/类型不匹配、重放确定性 |
 | `ShadowMergeTest` | STALE_VERSION 整批拒绝、UNKNOWN_FIELD/TYPE_MISMATCH 可区分、更新重放一致、UPDATE_ID_CONFLICT、拒绝批次重放 |
+| `BatchShadowUpdateTest` | 批量下发：逐台隔离与可区分原因、批次重放结论一致、batchId 换内容 BATCH_ID_CONFLICT、超限/空清单整批拒绝且不占用标识、300 台大批量与多批次并发不踩踏、单台/批量跨路径重放一致 |
 | `RuleTriggerConcurrencyTest` | 16 线程并发同一上升沿只下发一次、持续条件不重复触发、升降沿再触发、多设备并发 |
 | `OfflineReconnectTest` | 离线积压、重连升序补发一次、重复重连不重复、补发不回滚版本/状态、离线期乱序与重放语义 |
-| `HttpEndToEndTest` | MockMvc 全链路：注册/上线/规则/乱序上报/离线重连/影子更新拒绝 |
+| `HttpEndToEndTest` | MockMvc 全链路：注册/上线/规则/乱序上报/离线重连/影子更新拒绝/批量下发（含重放与 batchId 冲突） |
 | `ApplicationTests` | Spring 上下文装配冒烟 |
 
 日志样例（`target/surefire-reports/TEST-*.xml` 的 `system-out`）：
@@ -178,7 +237,7 @@ mvn test
 ```
 model/     枚举与不可变记录（影子、字段值、上报、更新、规则、命令、各类结论）
 store/     DeviceShadowStore：内存状态 + 每设备锁 + 事务原语
-service/   TelemetryService / ShadowService / RuleEngine / DeviceLifecycleService
+service/   TelemetryService / ShadowService / BatchShadowService / RuleEngine / DeviceLifecycleService
 web/       DeviceController / ShadowController / RuleAdminController
 config/    AppConfig（本地内存 Bean 装配）
 ```

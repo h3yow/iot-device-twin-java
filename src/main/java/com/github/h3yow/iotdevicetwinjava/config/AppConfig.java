@@ -1,5 +1,6 @@
 package com.github.h3yow.iotdevicetwinjava.config;
 
+import com.github.h3yow.iotdevicetwinjava.service.BatchShadowService;
 import com.github.h3yow.iotdevicetwinjava.service.DeviceLifecycleService;
 import com.github.h3yow.iotdevicetwinjava.service.RuleEngine;
 import com.github.h3yow.iotdevicetwinjava.service.ShadowService;
@@ -30,6 +31,11 @@ public class AppConfig {
     @Bean
     public ShadowService shadowService(DeviceShadowStore store, RuleEngine ruleEngine) {
         return new ShadowService(store, ruleEngine);
+    }
+
+    @Bean
+    public BatchShadowService batchShadowService(DeviceShadowStore store, ShadowService shadowService) {
+        return new BatchShadowService(store, shadowService, BatchShadowService.defaultDeviceExecutor());
     }
 
     @Bean
