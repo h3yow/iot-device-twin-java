@@ -29,7 +29,11 @@ import java.util.logging.Logger;
  * 3. 幂等重放：同一 updateId + 同一请求体重放，返回首次的完整结论
  *    （idempotentReplay=true），不重复写入、不重复触发；同 updateId 但请求体不同
  *    以 UPDATE_ID_CONFLICT 拒绝。
- * 4. 成功提交后 version +1，随后驱动一次规则评估（desired 也参与 merged 视图）。
+ * 4. 跨路径内容幂等：同一台设备上，内容（时间戳 + desired）与某次已处理更新完全
+ *    相同的请求——无论来自单台接口还是批量下发、无论 updateId 是否相同——都直接
+ *    回放该次首次结论（idempotentReplay=true），不再写状态、不再推进版本、不再
+ *    下发命令；首次被拒的内容重放时同样回放首次的拒绝结论。
+ * 5. 成功提交后 version +1，随后驱动一次规则评估（desired 也参与 merged 视图）。
  */
 public class ShadowService {
 
@@ -42,8 +46,17 @@ public class ShadowService {
      *  不同设备使用相同 updateId 也不会互相串判定。 */
     private final Map<String, String> updatePayloadSignatures = new ConcurrentHashMap<>();
 
+    /** "(deviceId, 内容签名)" -> 首次处理该内容的 updateId。跨路径内容幂等索引：
+     *  单台与批量对同一台设备下发同一份内容（时间戳 + desired 相同）时，靠它找到
+     *  首次结论并回放。只在设备锁内读写，与 updatePayloadSignatures 同一并发口径。 */
+    private final Map<String, String> contentFirstUpdateIds = new ConcurrentHashMap<>();
+
     private static String signatureKey(String deviceId, String updateId) {
         return deviceId + "#" + updateId;
+    }
+
+    private static String contentKey(String deviceId, String signature) {
+        return deviceId + "|" + signature;
     }
 
     public ShadowService(DeviceShadowStore store, RuleEngine ruleEngine) {
@@ -56,8 +69,23 @@ public class ShadowService {
                 + " baseVersion=" + update.baseVersion() + " 输入时间戳=" + update.timestamp()
                 + " desired=" + new TreeMap<>(update.desired()));
 
+        // 未注册设备：与批量路径同一拒绝结论（DEVICE_NOT_REGISTERED），确定性拒绝、
+        // 换路径重放结论一致；设备注册前无任何状态可写，无需落记忆。
+        if (store.registration(update.deviceId()).isEmpty()) {
+            LOG.info("[影子更新结论] device=" + update.deviceId()
+                    + " 判定依据=设备未注册 触发结果=DEVICE_NOT_REGISTERED，无副作用");
+            return unregisteredResult(update);
+        }
+
         return store.transact(update.deviceId(), (shadow, sink) ->
                 decide(update, update.baseVersion(), shadow, sink));
+    }
+
+    private static ShadowUpdateResult unregisteredResult(ShadowUpdate update) {
+        return new ShadowUpdateResult(update.deviceId(), false, 0L, 0L, false,
+                List.of(FieldOutcome.rejected("*", null, update.timestamp(), null, null,
+                        RejectReason.DEVICE_NOT_REGISTERED,
+                        "设备 '" + update.deviceId() + "' 未注册，拒绝下发（与批量路径结论一致）")));
     }
 
     /**
@@ -99,6 +127,27 @@ public class ShadowService {
                         + ") 触发结果=回放首次结论，无副作用");
                 return new ShadowUpdateResult(first.deviceId(), first.committed(),
                         shadow.version(), first.newVersion(), true, first.fields());
+            }
+
+            // ---- 跨路径内容幂等：updateId 没见过，但内容（时间戳+desired）与某次已处理
+            // 更新完全相同（可能来自单台/批量另一条路、另一批次或超时重试换的 updateId）。
+            // 直接回放首次结论：不再写状态、不推进版本、不重复下发命令；
+            // 首次被拒的内容同样回放首次拒绝结论。判定在版本校验之前，因此“先批量成功、
+            // 再单台发同内容”不会误报 STALE_VERSION。
+            String firstUpdateIdForContent = contentFirstUpdateIds.get(
+                    contentKey(update.deviceId(), signature));
+            if (firstUpdateIdForContent != null) {
+                ShadowUpdateResult firstByContent =
+                        shadow.processedUpdates().get(firstUpdateIdForContent);
+                if (firstByContent != null) {
+                    LOG.info("[影子更新结论] 判定依据=内容幂等重放(与 updateId="
+                            + firstUpdateIdForContent + " 时间戳+desired 完全相同，首次 committed="
+                            + firstByContent.committed() + " newVersion=" + firstByContent.newVersion()
+                            + ") 触发结果=回放首次结论，无副作用");
+                    return new ShadowUpdateResult(firstByContent.deviceId(),
+                            firstByContent.committed(), shadow.version(),
+                            firstByContent.newVersion(), true, firstByContent.fields());
+                }
             }
 
             // ---- 版本乐观锁检查（整批） ----
@@ -196,6 +245,10 @@ public class ShadowService {
                 shadow.deliveredDedupKeys(), shadow.processedReportIds(),
                 shadow.processedReportFingerprints(), Map.copyOf(remembered), shadow.ruleStates());
         updatePayloadSignatures.put(signatureKey(update.deviceId(), update.updateId()), signature);
+        // 内容索引只在首次处理该内容时建立；同内容后来的更新（任意 updateId/任意路径）
+        // 都回放这同一份首次结论。putIfAbsent 保证索引永远指向真正的“第一次”。
+        contentFirstUpdateIds.putIfAbsent(contentKey(update.deviceId(), signature),
+                update.updateId());
         sink.save(withMemory);
     }
 

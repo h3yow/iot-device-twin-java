@@ -37,6 +37,9 @@ import java.util.logging.Logger;
  * 3. 容量与并发：单批设备数不得超过 maxBatchSize，超限整批 BATCH_TOO_LARGE；
  *    不同设备由线程池并发处理（慢设备只占自己的任务），同一设备仍由设备锁串行，
  *    多个批次并发也不会在同一台设备上互相踩踏。
+ * 4. 跨路径一致：同一台设备收到与某次已处理更新内容（时间戳 + desired）完全相同
+ *    的请求——无论来自批量还是单台接口——由 ShadowService 的内容幂等索引识别为
+ *    重复，回放首次结论（含首次的拒绝结论），不重复写状态、不重复下发命令。
  */
 public class BatchDispatchService {
 
@@ -210,7 +213,7 @@ public class BatchDispatchService {
                 request.timestamp(), request.desired());
         ShadowUpdateResult result = shadowService.applyUpdateOnCurrentVersion(update);
         LOG.info("[批量逐台] batchId=" + request.batchId() + " device=" + deviceId
-                + " 判定依据=" + (result.idempotentReplay() ? "单台幂等回放(updateId 首次结论)"
+                + " 判定依据=" + (result.idempotentReplay() ? "幂等回放(该设备上同内容/同 updateId 的首次结论)"
                 : result.committed() ? "当前版本校验通过且字段合法" : outcomeReasons(result))
                 + " 最终结果=" + (result.committed() ? "生效@v" + result.newVersion()
                 : "被拒(" + topReason(result) + ")"));
