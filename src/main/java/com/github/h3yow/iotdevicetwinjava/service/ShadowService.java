@@ -29,7 +29,13 @@ import java.util.logging.Logger;
  * 3. 幂等重放：同一 updateId + 同一请求体重放，返回首次的完整结论
  *    （idempotentReplay=true），不重复写入、不重复触发；同 updateId 但请求体不同
  *    以 UPDATE_ID_CONFLICT 拒绝。
- * 4. 成功提交后 version +1，随后驱动一次规则评估（desired 也参与 merged 视图）。
+ * 4. 跨路径内容幂等：同一台设备上，内容签名（时间戳 + 排序后的 desired）相同的
+ *    更新，无论走单台 {@link #applyUpdate} 还是批量 {@link #applyUpdateOnCurrentVersion}，
+ *    也无论 updateId 是否相同，都回放首次结论（idempotentReplay=true），不重复写状态、
+ *    不推进版本、不重复下发命令。内容级拒绝（UNKNOWN_FIELD/TYPE_MISMATCH）同样按内容
+ *    记忆并跨路径回放；STALE_VERSION 与调用方 baseVersion 相关、UPDATE_ID_CONFLICT 与
+ *    updateId 误用相关，均非内容固有结论，不按内容记忆。
+ * 5. 成功提交后 version +1，随后驱动一次规则评估（desired 也参与 merged 视图）。
  */
 public class ShadowService {
 
@@ -42,8 +48,17 @@ public class ShadowService {
      *  不同设备使用相同 updateId 也不会互相串判定。 */
     private final Map<String, String> updatePayloadSignatures = new ConcurrentHashMap<>();
 
+    /** "(deviceId, 内容签名)" -> 首次内容级结论（提交或内容固有的拒绝）。
+     *  单台与批量两条路对同一台设备下发同一份内容时，靠它认出重复并回放首次结论；
+     *  全部读写都发生在设备锁内（decide 由 transact 调用），并发下结论确定。 */
+    private final Map<String, ShadowUpdateResult> contentOutcomes = new ConcurrentHashMap<>();
+
     private static String signatureKey(String deviceId, String updateId) {
         return deviceId + "#" + updateId;
+    }
+
+    private static String contentKey(String deviceId, String signature) {
+        return deviceId + "#content#" + signature;
     }
 
     public ShadowService(DeviceShadowStore store, RuleEngine ruleEngine) {
@@ -56,6 +71,9 @@ public class ShadowService {
                 + " baseVersion=" + update.baseVersion() + " 输入时间戳=" + update.timestamp()
                 + " desired=" + new TreeMap<>(update.desired()));
 
+        if (store.registration(update.deviceId()).isEmpty()) {
+            return unregistered(update);
+        }
         return store.transact(update.deviceId(), (shadow, sink) ->
                 decide(update, update.baseVersion(), shadow, sink));
     }
@@ -71,8 +89,22 @@ public class ShadowService {
                 + " baseVersion=(取当前版本)" + " 输入时间戳=" + update.timestamp()
                 + " desired=" + new TreeMap<>(update.desired()));
 
+        if (store.registration(update.deviceId()).isEmpty()) {
+            return unregistered(update);
+        }
         return store.transact(update.deviceId(), (shadow, sink) ->
                 decide(update, shadow.version(), shadow, sink));
+    }
+
+    /** 未注册设备的明确拒绝：两条路结论一致（与批量路径的 DEVICE_NOT_REGISTERED 相同），
+     *  不抛异常、不写状态；不记入内容记忆，设备后续注册后同内容可按全新请求处理。 */
+    private static ShadowUpdateResult unregistered(ShadowUpdate update) {
+        LOG.info("[影子更新结论] device=" + update.deviceId()
+                + " 判定依据=设备未注册 触发结果=DEVICE_NOT_REGISTERED，无副作用");
+        return new ShadowUpdateResult(update.deviceId(), false, 0L, 0L, false,
+                List.of(FieldOutcome.rejected("*", null, update.timestamp(), null, null,
+                        RejectReason.DEVICE_NOT_REGISTERED,
+                        "设备 '" + update.deviceId() + "' 未注册，拒绝下发")));
     }
 
     /** 在设备锁内完成幂等键判定 -> 版本/schema 校验 -> 提交或拒绝并记忆。 */
@@ -97,8 +129,18 @@ public class ShadowService {
                 LOG.info("[影子更新结论] 判定依据=updateId 幂等重放(首次 committed="
                         + first.committed() + " newVersion=" + first.newVersion()
                         + ") 触发结果=回放首次结论，无副作用");
-                return new ShadowUpdateResult(first.deviceId(), first.committed(),
-                        shadow.version(), first.newVersion(), true, first.fields());
+                return replayOf(first, shadow.version());
+            }
+
+            // ---- 跨路径内容幂等：同设备同内容（时间戳+desired 一致），无论 updateId/入口 ----
+            // 单台与批量派生的 updateId 不同，只有内容签名一致才能认出“同一份内容重发”。
+            ShadowUpdateResult contentFirst = contentOutcomes.get(
+                    contentKey(update.deviceId(), signature));
+            if (contentFirst != null) {
+                LOG.info("[影子更新结论] 判定依据=内容幂等重放(同设备同内容已处理过，首次 committed="
+                        + contentFirst.committed() + " newVersion=" + contentFirst.newVersion()
+                        + ") 触发结果=回放首次结论，不重复写状态/不推进版本/不重复下发命令");
+                return replayOf(contentFirst, shadow.version());
             }
 
             // ---- 版本乐观锁检查（整批） ----
@@ -146,6 +188,11 @@ public class ShadowService {
                 ShadowUpdateResult rejected = new ShadowUpdateResult(update.deviceId(), false,
                         shadow.version(), shadow.version(), false, List.copyOf(outcomes));
                 remember(sink, shadow, update, rejected, signature);
+                if (!staleVersion) {
+                    // 内容固有的拒绝（UNKNOWN_FIELD/TYPE_MISMATCH）：跨路径按内容回放同一结论。
+                    // STALE_VERSION 取决于调用方 baseVersion，不是内容属性，不按内容记忆。
+                    contentOutcomes.put(contentKey(update.deviceId(), signature), rejected);
+                }
                 LOG.info("[影子更新结论] version 保持=" + shadow.version() + " 判定依据="
                         + outcomeReasons(rejected) + " 触发结果=整批拒绝，无副作用");
                 return rejected;
@@ -170,12 +217,20 @@ public class ShadowService {
             ShadowUpdateResult committed = new ShadowUpdateResult(update.deviceId(), true,
                     shadow.version(), newVersion, false, List.copyOf(outcomes));
             remember(sink, written, update, committed, signature);
+            contentOutcomes.put(contentKey(update.deviceId(), signature), committed);
 
             long fired = evaluation.triggers().stream().filter(TriggerResult::fired).count();
             LOG.info("[影子更新结论] v" + shadow.version() + " -> v" + newVersion
                     + " 判定依据=版本匹配且字段全部合法 触发结果=规则触发" + fired + "条 命令"
                     + evaluation.commands().size() + "条");
             return committed;
+    }
+
+    /** 回放首次结论：committed/newVersion/逐字段判定与首次完全一致，
+     *  currentVersion 取回放时的当前版本，标记 idempotentReplay=true。 */
+    private static ShadowUpdateResult replayOf(ShadowUpdateResult first, long currentVersion) {
+        return new ShadowUpdateResult(first.deviceId(), first.committed(),
+                currentVersion, first.newVersion(), true, first.fields());
     }
 
     private String outcomeReasons(ShadowUpdateResult r) {

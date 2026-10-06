@@ -113,7 +113,15 @@ curl -X POST localhost:8080/api/shadows/batch-update -H 'Content-Type: applicati
    （`idempotentReplay=true`），不重复写入、不重复触发；
    相同 `updateId` 但**不同请求体** → `UPDATE_ID_CONFLICT` 拒绝。
    被拒绝的批次结论同样被记忆，重放得到相同拒绝结论。
-4. 成功提交后 `version + 1` 并驱动规则评估。
+4. **跨路径内容幂等**：同一台设备上，**内容签名（`timestamp` + 排序后的 `desired`）
+   相同**的更新——无论走单台接口还是批量接口、无论 `updateId` 是否相同——都视为
+   同一份内容的重复下发：直接回放首次结论（`idempotentReplay=true`），
+   **不重复写状态、不推进版本、不重复下发命令**。首次被内容固有原因拒绝
+   （`UNKNOWN_FIELD`/`TYPE_MISMATCH`）的，换路径重发同样回放该拒绝结论。
+   注意 `STALE_VERSION`（取决于调用方携带的 baseVersion）与 `UPDATE_ID_CONFLICT`
+   （updateId 误用）不是内容固有结论，不按内容记忆；设备未注册的拒绝也不按内容
+   记忆——设备注册后同一份内容会按全新请求正常生效。
+5. 成功提交后 `version + 1` 并驱动规则评估。
 
 ### 3.3 批量期望配置下发（`BatchDispatchService`）
 
@@ -159,6 +167,26 @@ curl -X POST localhost:8080/api/shadows/batch-update -H 'Content-Type: applicati
   也不会丢更新。
 - 单台与批量对同一台设备重放同一份内容：都不会重复写状态、不会重复下发命令，
   各自返回首次结论（见 `BatchDispatchTest.singleAndBatchPathsAgreeOnReplayOfSameContent`）。
+
+**同一台设备重复下发同一份内容（跨路径语义）**
+
+“同一份内容”指 `timestamp` 与 `desired` 完全一致（内容签名相同），与走哪条路、
+`updateId`/`batchId` 是什么无关。对同一台设备：
+
+- **先单台后批量**：单台接口成功下发后，批量接口原样再发同一份内容，该台
+  `devices[i].result.idempotentReplay=true`，回放首次结论（含首次的 `newVersion`），
+  版本不再推进、命令不再重复下发；同批其他设备不受影响，各自独立判定。
+- **先批量后单台**：批量接口成功下发后，单台接口原样再发同一份内容——即使客户端
+  还拿着下发前的旧 `baseVersion`——也回放首次成功结论，**不会**报 `STALE_VERSION`。
+- **首次被拒同样一致**：未注册（`DEVICE_NOT_REGISTERED`）、未知字段
+  （`UNKNOWN_FIELD`）、类型不符（`TYPE_MISMATCH`）的设备，无论重放同一批还是换
+  另一条路发同样内容，都得到与首次完全相同的拒绝结论，不会一会儿被拒一会儿写入；
+  某台的拒绝不影响其他设备已生效的结果，各台结论与版本互不串扰。
+- **并发混跑**：同一台设备被单台与批量、多个批次、超时重试同时打过来时，设备锁
+  把这台设备上的处理串行化：同一份内容恰好生效一次（全部并发调用中恰好一次真实
+  提交，其余都是幂等回放），版本不凭空多涨、命令不重复下发；同 `batchId` 换内容
+  仍整批 `BATCH_ID_CONFLICT`，不覆盖已有结论、不写一半。
+- 复现与验证见 `CrossPathIdempotencyTest`（第 5 节）。
 
 **批次幂等重放与标识冲突**
 
@@ -238,6 +266,7 @@ mvn test
 | `OfflineReconnectTest` | 离线积压、重连升序补发一次、重复重连不重复、补发不回滚版本/状态、离线期乱序与重放语义 |
 | `HttpEndToEndTest` | MockMvc 全链路：注册/上线/规则/乱序上报/离线重连/影子更新拒绝/批量下发·重放·标识冲突 |
 | `BatchDispatchTest` | 批量逐台隔离、UNKNOWN_FIELD/TYPE_MISMATCH/未注册逐台拒绝、批次重放结论一致无重复副作用、拒绝结论也稳定回放、batchId 换内容 BATCH_ID_CONFLICT、超容量整批拒绝、非法批次、300 台大批量、12 批并发共享设备不踩踏、单台与批量结论一致 |
+| `CrossPathIdempotencyTest` | 跨路径内容幂等：先单台后批量/先批量后单台同内容互放（回放首次结论、不重复写不重复下发）、被拒设备跨路径同因拒绝（未注册/未知字段/类型不符）、单台与批量并发混跑同内容恰好生效一次、跨路径生效后 batchId 换内容仍 BATCH_ID_CONFLICT |
 | `ApplicationTests` | Spring 上下文装配冒烟 |
 
 日志样例（`target/surefire-reports/TEST-*.xml` 的 `system-out`）：
@@ -249,15 +278,29 @@ mvn test
 [重连补发] device=dev-E 命令=cmd-dev-E-r-hot-v3 判定依据=离线积压且未下发过 触发结果=补发一次(RECONNECT)，状态不回滚
 [批量逐台] batchId=b-20261003-01 device=dev2 判定依据=当前版本校验通过且字段合法 最终结果=生效@v1
 [批量重放] batchId=b-20261003-01 判定依据=batchId+内容一致 触发结果=回放首次逐台结论，无设备副作用、不重复下发命令
+[影子更新结论] 判定依据=内容幂等重放(同设备同内容已处理过，首次 committed=true newVersion=1) 触发结果=回放首次结论，不重复写状态/不推进版本/不重复下发命令
 ```
 
 本地复现批量语义：
 
 ```bash
 mvn test -Dtest=BatchDispatchTest            # 只跑批量 10 个用例
-mvn test                                      # 全量 28 个用例，应全部通过
+mvn test                                      # 全量 33 个用例，应全部通过
 # 日志位置：target/surefire-reports/TEST-*BatchDispatchTest.xml 的 system-out，
 # 可按 batchId / device 追溯每台设备的判定依据与最终结果
+```
+
+本地复现“同一台设备重复下发同一份内容”的跨路径语义：
+
+```bash
+mvn test -Dtest=CrossPathIdempotencyTest      # 5 个跨路径用例
+# 关键用例：
+#   singleThenBatchSameContentReplaysFirstConclusion   先单台后批量，批量认出重复
+#   batchThenSingleSameContentReplaysInsteadOfStaleVersion  先批量后单台，不再报版本冲突
+#   rejectedDevicesReplaySameConclusionAcrossPaths     被拒设备换路径重发同因拒绝
+#   concurrentSingleAndBatchSameContentCommitExactlyOnce  并发混跑恰好生效一次
+# 日志位置：target/surefire-reports/TEST-*CrossPathIdempotencyTest.xml 的 system-out，
+# 可看到每个 batchId、每台设备的判定依据（内容幂等重放/全新提交/拒绝原因）与最终结论
 ```
 
 每条结论都可从日志追溯：**输入是什么（含时间戳）→ 依据什么规则判定 → 产生了什么结果**。
